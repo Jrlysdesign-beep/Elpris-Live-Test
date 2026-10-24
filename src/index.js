@@ -1,17 +1,84 @@
-// Elpris Live: isolated foundation. No credentials or charging controls are stored here.
-const json=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{"content-type":"application/json; charset=utf-8","cache-control":"no-store","x-content-type-options":"nosniff"}});
+import {encrypt,digest,randomSession} from "./security.js";
+import {collectEnabled} from "./collector.js";
+import {zaptecRequest,parseStates} from "./zaptec.js";
+const ORIGIN="https://jrlysdesign-beep.github.io";
+const json=(body,status=200,origin=null)=>new Response(JSON.stringify(body),{status,headers:{
+ "content-type":"application/json; charset=utf-8","cache-control":"no-store",
+ "x-content-type-options":"nosniff",...(origin===ORIGIN?{"access-control-allow-origin":ORIGIN,"vary":"Origin"}:{})}});
+const uid=x=>typeof x==="string"&&/^[0-9a-f-]{36}$/i.test(x);
+async function session(request,env){
+ const bearer=(request.headers.get("authorization")||"").match(/^Bearer ([a-zA-Z0-9_-]{32,128})$/);
+ if(!bearer)throw Error("Unauthorized");
+ const hash=await digest(bearer[1]);
+ const row=await env.DB.prepare(`SELECT s.user_id FROM app_sessions s JOIN users u ON u.id=s.user_id
+ WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>?
+ AND u.revoked_at IS NULL`).bind(hash,new Date().toISOString()).first();
+ if(!row)throw Error("Unauthorized");
+ return {userId:row.user_id,hash};
+}
 export default {
-  async fetch(request,env){
-    const url=new URL(request.url);
-    if(request.method==="GET"&&url.pathname==="/health")
-      return json({service:"elpris-live-test",status:"ready",database:!!env.DB,automaticCollection:"not-configured"});
-    if(request.method==="GET"&&url.pathname==="/")
-      return new Response("Elpris Live API · initial setup. Charging collection is not active.",{headers:{"content-type":"text/plain; charset=utf-8"}});
-    return json({error:"Not found"},404);
-  },
-  async scheduled(event,env,ctx){
-    // Fail closed: do not call Zaptec until per-user secure authorization,
-    // validated meter identifiers and idempotent collection are implemented.
-    console.log("Elpris Live scheduler heartbeat",new Date(event.scheduledTime).toISOString());
+ async fetch(request,env){
+  const url=new URL(request.url),origin=request.headers.get("origin");
+  if(request.method==="OPTIONS")return new Response(null,{status:origin===ORIGIN?204:403,headers:origin===ORIGIN?{
+   "access-control-allow-origin":ORIGIN,"access-control-allow-methods":"GET,POST,OPTIONS",
+   "access-control-allow-headers":"Content-Type,Authorization","vary":"Origin"}:{}});
+  if(request.method==="GET"&&url.pathname==="/health")
+   return json({service:"elpris-live-test",status:"ready",database:!!env.DB,collection:"disabled_pending_validation"});
+  if(request.method==="GET"&&url.pathname==="/")return new Response("Elpris Live API · setup",{
+   headers:{"content-type":"text/plain; charset=utf-8"}});
+  if(!url.pathname.startsWith("/api/"))return json({error:"Not found"},404);
+  if(origin!==ORIGIN)return json({error:"Origin not allowed"},403,origin);
+  if(!env.DB||!env.TOKEN_SECRET||env.TOKEN_SECRET.length<32)return json({error:"Server not configured"},503,origin);
+  if(url.pathname==="/api/login"&&request.method==="POST"){
+   if(!env.LOGIN_RATE_LIMIT)return json({error:"Login rate limit unavailable"},503,origin);
+   const ip=request.headers.get("CF-Connecting-IP");
+   if(!ip||!(await env.LOGIN_RATE_LIMIT.limit({key:ip})).success)return json({error:"Login rate limited"},429,origin);
+   if(Number(request.headers.get("content-length")||0)>2048)return json({error:"Request too large"},413,origin);
+   let data;try{data=await request.json()}catch{return json({error:"Invalid JSON"},400,origin)}
+   const email=typeof data?.email==="string"?data.email.trim():"";
+   const password=typeof data?.password==="string"?data.password:"";
+   if(!email||email.length>254||!password||password.length>256)return json({error:"Invalid credentials"},400,origin);
+   try{
+    const auth=await fetch("https://api.zaptec.com/oauth/token",{
+     method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},
+     body:new URLSearchParams({grant_type:"password",username:email,password}),
+     signal:AbortSignal.timeout(12000)});
+    if(!auth.ok)return json({error:"Zaptec login rejected"},401,origin);
+    const tokens=await auth.json();
+    if(!tokens.access_token)return json({error:"No access token"},502,origin);
+    // A verified Zaptec user ID, not a client-provided email, is the identity.
+    const profile=await zaptecRequest("/api/user",tokens.access_token);
+    const userId=profile?.Id??profile?.id;
+    if(!uid(userId))return json({error:"Could not verify Zaptec identity"},502,origin);
+    const sessionToken=randomSession(),hash=await digest(sessionToken);
+    const expiry=new Date(Date.now()+45*60000).toISOString();
+    const encrypted=await encrypt(tokens.access_token,env.TOKEN_SECRET);
+    const refresh=tokens.refresh_token?await encrypt(tokens.refresh_token,env.TOKEN_SECRET):null;
+    await env.DB.batch([
+     env.DB.prepare("INSERT OR IGNORE INTO users(id) VALUES (?)").bind(userId),
+     env.DB.prepare("INSERT INTO app_sessions(token_hash,user_id,expires_at) VALUES (?,?,?)").bind(hash,userId,expiry)
+    ]);
+    // Credential is persisted only for chargers explicitly enabled later.
+    return json({session:sessionToken,expiresAt:expiry,refreshSupported:!!refresh,
+     note:"No charger monitoring is enabled by login alone."},200,origin);
+   }catch{return json({error:"Could not authenticate with Zaptec"},502,origin)}
   }
+  let auth;try{auth=await session(request,env)}catch{return json({error:"Unauthorized"},401,origin)}
+  if(url.pathname==="/api/logout"&&request.method==="POST"){
+   await env.DB.prepare("UPDATE app_sessions SET revoked_at=? WHERE token_hash=?")
+    .bind(new Date().toISOString(),auth.hash).run();
+   return json({loggedOut:true},200,origin);
+  }
+  if(url.pathname==="/api/connections"&&request.method==="GET"){
+   const rows=await env.DB.prepare(`SELECT id,charger_id,display_name,enabled FROM charger_connections
+    WHERE user_id=? ORDER BY display_name`).bind(auth.userId).all();
+   return json({connections:rows.results||[]},200,origin);
+  }
+  return json({error:"Not found"},404,origin);
+ },
+ async scheduled(event,env,ctx){
+  if(env.COLLECTION_ENABLED!=="true"){console.log("Collection disabled pending meter validation");return}
+  ctx.waitUntil(collectEnabled(env).then(rows=>console.log("Collection status",JSON.stringify(rows)))
+   .catch(e=>console.error("Collection failed",String(e.message))));
+ }
 };
