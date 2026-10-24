@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS charger_connections (
  charger_id TEXT NOT NULL,
  display_name TEXT,
  encrypted_refresh_credential TEXT,
+ encrypted_access_token TEXT,
+ access_expires_at TEXT,
  credential_expires_at TEXT,
  enabled INTEGER NOT NULL DEFAULT 0,
  created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -45,3 +47,11 @@ CREATE TABLE IF NOT EXISTS quarter_prices (
  source TEXT NOT NULL,
  PRIMARY KEY(area,quarter_start_utc)
 );
+
+CREATE TABLE IF NOT EXISTS app_sessions (
+ token_hash TEXT PRIMARY KEY,
+ user_id TEXT NOT NULL REFERENCES users(id),
+ expires_at TEXT NOT NULL,
+ revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS app_sessions_by_user ON app_sessions(user_id);
