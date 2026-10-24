@@ -55,3 +55,11 @@ CREATE TABLE IF NOT EXISTS app_sessions (
  revoked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS app_sessions_by_user ON app_sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS user_credentials (
+ user_id TEXT PRIMARY KEY REFERENCES users(id),
+ encrypted_access_token TEXT NOT NULL,
+ encrypted_refresh_credential TEXT,
+ access_expires_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL
+);
