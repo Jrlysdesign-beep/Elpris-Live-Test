@@ -30,11 +30,15 @@ export async function collectOne(connection,env,now=new Date()){
  const skew=now.getTime()-Date.parse(observed);
  if(skew < -120000||skew > 10*60000)return {status:"stale_energy_observation"};
  const id=crypto.randomUUID();
+ const sessionKey=state.sessionId?String(state.sessionId).slice(0,128):null;
+ // Only persist readings with the source observation timestamp. A session counter
+ // must never be interpreted as a lifetime meter or joined across sessions.
+ if(!sessionKey)return {status:"missing_session_identity"};
  await env.DB.prepare(`INSERT OR IGNORE INTO meter_readings
  (id,connection_id,session_id,observed_at,received_at,meter_kwh,power_kw,charging,source)
  VALUES (?,?,NULL,?,?,?,?,?,'zaptec_state_553')`)
  .bind(id,connection.id,observed,now.toISOString(),state.sessionKwh,state.powerKw,state.charging?1:0).run();
- return {status:"sampled",observedAt:observed,mode:state.mode,sessionId:state.sessionId};
+ return {status:"sampled",observedAt:observed,mode:state.mode,sessionId:sessionKey};
 }
 export async function collectEnabled(env,{limit=20}={}){
  if(!env.DB||!env.TOKEN_SECRET)throw Error("Missing DB or TOKEN_SECRET");
